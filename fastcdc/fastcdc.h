@@ -105,6 +105,10 @@ class ChunkerTmpl {
     data_.reserve(cfg_.max_size << 1);
     InitStages();
   }
+  // Destructor.
+  ~ChunkerTmpl(){
+    Finalize();
+  }
 
   // Slices the given data block into chunks and calls the specified handler
   // function for each chunk cut-point. The remaining data is buffered and used
@@ -264,6 +268,22 @@ class ChunkerTmpl {
   MaskStage stages_[mask_stages];
   std::vector<uint8_t> data_;
 };
+
+template <typename T, const T gear[256],
+          uint32_t mask_stages = default_mask_stages,
+          uint32_t mask_lshift = default_mask_lshift>
+std::istream& operator>> (std::istream &in, ChunkerTmpl<T, gear, mask_stages, mask_lshift> &chunker) {
+  char buffer[8192];
+  while(!in.eof()){
+    if(!in.good()){
+      throw std::runtime_error("failure");
+    }
+    in.read(buffer, sizeof buffer);
+    std::streamsize dataSize = in.gcount();
+    chunker.Process((uint8_t*)buffer, dataSize);
+  }
+  return in;
+}
 
 namespace internal {
 
