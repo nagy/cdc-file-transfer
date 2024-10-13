@@ -14,6 +14,30 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
+      - name: Use last commit hash as build version for the developer build.
+        if: "startsWith(github.ref, 'refs/heads/')"
+        run: echo "build_version=${GITHUB_SHA}" >> $GITHUB_ENV
+
+      - name: Use tag name as build version for the release build.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: echo "build_version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+      # This flow should not be used for pull requests. However the section
+      # below might be useful for testing purposes.
+      - name: Use last commit hash as build version for the pull request
+        if: startsWith(github.ref, 'refs/pull')
+        run: echo "build_version=${GITHUB_SHA}" >> $GITHUB_ENV
+
+      - name: Replace CDC_BUILD_VERSION
+        run: |
+          if grep -q "DCDC_BUILD_VERSION=DEV" "common/BUILD"; then
+              sed -i 's/DCDC_BUILD_VERSION=DEV/DCDC_BUILD_VERSION=${{ env.build_version }}/g' common/BUILD
+          else
+              echo "CDC_BUILD_VERSION was moved out from common/BUILD file."
+              echo "Please edit create_release.yaml workflow."
+              exit 1
+          fi
+
       - name: Initialize submodules
         run: git submodule update --init --recursive
 
@@ -39,7 +63,6 @@ jobs:
                      --test_output=errors --local_test_jobs=1  \
                      -- //... -//third_party/... -//cdc_rsync_server:file_finder_test
 
-      # The artifact collector doesn't like the fact that bazel-bin is a symlink.
       - name: Copy artifacts
         run: |
           mkdir artifacts
@@ -57,6 +80,40 @@ jobs:
     runs-on: windows-2019
     steps:
       - uses: actions/checkout@v3
+
+      - name: Use last commit hash as build version for the developer build.
+        if: "startsWith(github.ref, 'refs/heads/')"
+        run: |
+          $build_version="${{ github.sha }}"
+          echo "build_version=$build_version" >> $env:GITHUB_ENV
+
+      - name: Use tag name as build version for the release build.
+        if: "startsWith(github.ref, 'refs/tags/v')"
+        run: |
+          $build_version="${{ github.ref }}".replace("refs/tags/v", "")
+          echo "build_version=$build_version" >> $env:GITHUB_ENV
+
+      # This flow should not be used for pull requests. However the section
+      # below might be useful for testing purposes.
+      - name: Use last commit hash as build version for the pull request
+        if: startsWith(github.ref, 'refs/pull')
+        run: |
+          $build_version="${{ github.sha }}"
+          echo "build_version=$build_version" >> $env:GITHUB_ENV
+
+      - name: Replace CDC_BUILD_VERSION
+        run: |
+          $cdc_version = Select-String -Path common/BUILD -Pattern "DCDC_BUILD_VERSION=DEV"
+          if ($cdc_version -ne $null) {
+              $build_file = Get-Content -path common/BUILD -Raw
+              $build_file = $build_file -replace 'DCDC_BUILD_VERSION=DEV','DCDC_BUILD_VERSION=${{ env.build_version }}'
+              $build_file | Set-Content -Path common/BUILD
+          }
+          else {
+              Write-Host "CDC_BUILD_VERSION was moved out from common/BUILD file."
+              Write-Host "Please edit create_release.yaml workflow."
+              exit 1
+          }
 
       - name: Initialize submodules
         run: git submodule update --init --recursive
@@ -94,14 +151,16 @@ jobs:
             //manifest/... `
             //metrics/...
 
-      # The artifact collector doesn't like the fact that bazel-bin is a symlink.
       - name: Copy artifacts
         run: |
           mkdir artifacts
+          mkdir artifacts\docs
           cp bazel-bin/cdc_rsync/cdc_rsync.exe artifacts
+          cp bazel-bin/cdc_rsync_server/cdc_rsync_server.exe artifacts
           cp bazel-bin/cdc_stream/cdc_stream.exe artifacts
           cp LICENSE artifacts
           cp README.md artifacts
+          cp docs\* artifacts\docs
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v3
@@ -119,7 +178,10 @@ jobs:
       - name: Zip binaries
         run: |
           # The ref resolves to "main" for latest and e.g. "v0.1.0" for tagged.
-          BINARIES_ZIP_NAME=cdc-file-transfer-binaries-${GITHUB_REF#refs/*/}-x64.zip
+          REF=${GITHUB_REF#refs/*/}
+          # For pull requests, this is e.g. '70/merge', so replace / with -.
+          REF=${REF/\//-}
+          BINARIES_ZIP_NAME=cdc-file-transfer-binaries-$REF-x64.zip
           echo "BINARIES_ZIP_NAME=$BINARIES_ZIP_NAME" >> $GITHUB_ENV
           zip -j $BINARIES_ZIP_NAME Windows-Artifacts/* Linux-Artifacts/*
 

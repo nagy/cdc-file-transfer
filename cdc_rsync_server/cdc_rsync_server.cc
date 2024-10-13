@@ -19,11 +19,12 @@
 #include "cdc_rsync/protos/messages.pb.h"
 #include "cdc_rsync_server/file_deleter_and_sender.h"
 #include "cdc_rsync_server/file_finder.h"
-#include "cdc_rsync_server/server_socket.h"
 #include "cdc_rsync_server/unzstd_stream.h"
 #include "common/log.h"
 #include "common/path.h"
+#include "common/server_socket.h"
 #include "common/status.h"
+#include "common/status_macros.h"
 #include "common/stopwatch.h"
 #include "common/threadpool.h"
 #include "common/util.h"
@@ -32,8 +33,21 @@ namespace cdc_ft {
 
 namespace {
 
+// Number of files for which to call fclose() and finalize files in parallel.
+constexpr size_t kNumFinalizerThreads = 8;
+
+// Max 16 files in the patcher and finalizer queues to prevent that too many
+// files are open concurrently.
+constexpr size_t kMaxQueueSize = 16;
+
 // Suffix for the patched file created from the basis file and the diff.
 constexpr char kIntermediatePathSuffix[] = ".__cdc_rsync_temp__";
+
+#if PLATFORM_WINDOWS
+constexpr char kServerFilename[] = "cdc_rsync_server.exe";
+#elif PLATFORM_LINUX
+constexpr char kServerFilename[] = "cdc_rsync_server";
+#endif
 
 uint16_t kExecutableBits =
     path::MODE_IXUSR | path::MODE_IXGRP | path::MODE_IXOTH;
@@ -43,6 +57,9 @@ uint16_t kExecutableBits =
 // |target_filepath| match, writes an intermediate file and replaces
 // the file at |target_filepath| with the intermediate file when all data has
 // been received.
+// Each PatchTask is queued twice, once to create the patched file, and once in
+// a different thread pool to close and finalize the patched file. This is
+// because fclose() can take a long time to finish, so it could block patching.
 class PatchTask : public Task {
  public:
   PatchTask(const std::string& base_filepath,
@@ -51,9 +68,16 @@ class PatchTask : public Task {
       : base_filepath_(base_filepath),
         target_filepath_(target_filepath),
         file_(file),
-        cdc_(cdc) {}
+        cdc_(cdc),
+        need_intermediate_file_(target_filepath_ == base_filepath_),
+        patched_filepath_(target_filepath_ == base_filepath_
+                              ? base_filepath_ + kIntermediatePathSuffix
+                              : target_filepath_) {}
 
   virtual ~PatchTask() = default;
+
+  PatchTask(const PatchTask& other) = delete;
+  PatchTask& operator=(const PatchTask& other) = delete;
 
   const ChangedFileInfo& File() const { return file_; }
 
@@ -61,28 +85,52 @@ class PatchTask : public Task {
 
   // Task:
   void ThreadRun(IsCancelledPredicate is_cancelled) override {
-    bool need_intermediate_file = target_filepath_ == base_filepath_;
-    std::string patched_filepath =
-        need_intermediate_file ? base_filepath_ + kIntermediatePathSuffix
-                               : target_filepath_;
+    // Each PatchTask is queued twice, once to apply the patch and once to
+    // close and finalize the patched file.
+    switch (state_) {
+      case State::kPatching:
+        Patch();
+        state_ = State::kFinalizing;
+        break;
+      case State::kFinalizing:
+        Finalize();
+        state_ = State::kDone;
+        break;
+      default:
+        assert(!"Invalid state");
+    }
+  }
 
-    absl::StatusOr<FILE*> patched_file = path::OpenFile(patched_filepath, "wb");
-    if (!patched_file.ok()) {
-      status_ = patched_file.status();
+ private:
+  void Patch() {
+    absl::StatusOr<FILE*> patched_fp = path::OpenFile(patched_filepath_, "wb");
+    if (!patched_fp.ok()) {
+      status_ = patched_fp.status();
       return;
     }
+    patched_fp_ = *patched_fp;
 
     // Receive diff stream from server and apply.
-    bool is_executable = false;
-    status_ = cdc_->ReceiveDiffAndPatch(base_filepath_, *patched_file,
-                                        &is_executable);
-    fclose(*patched_file);
+    status_ =
+        cdc_->ReceiveDiffAndPatch(base_filepath_, patched_fp_, &is_executable_);
+
+    // The file is closed by Finalize() in a separate thread pool since fclose()
+    // takes a while on some systems.
+  }
+
+  void Finalize() {
+    if (patched_fp_) {
+      fclose(patched_fp_);
+      patched_fp_ = nullptr;
+    }
+
     if (!status_.ok()) {
+      // Some error occurred during Patch().
       return;
     }
 
     // These bits are OR'ed on top of the mode bits.
-    uint16_t mode_or_bits = is_executable ? kExecutableBits : 0;
+    uint16_t mode_or_bits = is_executable_ ? kExecutableBits : 0;
 
     // Store mode from the original base path.
     path::Stats stats;
@@ -93,13 +141,13 @@ class PatchTask : public Task {
       return;
     }
 
-    if (need_intermediate_file) {
+    if (need_intermediate_file_) {
       // Replace |base_filepath_| (==|target_filepath_|) by the intermediate
       // file |patched_filepath|.
-      status_ = path::ReplaceFile(target_filepath_, patched_filepath);
+      status_ = path::ReplaceFile(target_filepath_, patched_filepath_);
       if (!status_.ok()) {
         status_ = WrapStatus(status_, "ReplaceFile() for '%s' by '%s' failed",
-                             base_filepath_, patched_filepath);
+                             base_filepath_, patched_filepath_);
         return;
       }
     } else {
@@ -120,11 +168,82 @@ class PatchTask : public Task {
     status_ = path::SetFileTime(target_filepath_, file_.client_modified_time);
   }
 
+  const std::string base_filepath_;
+  const std::string target_filepath_;
+  const ChangedFileInfo file_;
+  CdcInterface* const cdc_;
+  const bool need_intermediate_file_ = false;
+  const std::string patched_filepath_;
+
+  FILE* patched_fp_ = nullptr;
+  bool is_executable_ = false;
+  absl::Status status_;
+
+  // This task is queued twice, once to patch and once to close and finalize the
+  // patched file.
+  enum class State { kPatching, kFinalizing, kDone };
+  State state_ = State::kPatching;
+};
+
+// Background task that closes a file and sets the mtime and perms. This is done
+// in the background since closing a file might block for a long time.
+class FinalizeCopiedFileTask : public Task {
+ public:
+  // Finalize |file| with given path |filepath|. |status| is the status from
+  // writing the file. On error, the file is only closed.
+  FinalizeCopiedFileTask(FILE* fp, FileInfo file, std::string filepath,
+                         bool is_executable, absl::Status status)
+      : fp_(fp),
+        file_(std::move(file)),
+        filepath_(std::move(filepath)),
+        is_executable_(is_executable),
+        status_(status) {}
+  virtual ~FinalizeCopiedFileTask() = default;
+
+  FinalizeCopiedFileTask(const FinalizeCopiedFileTask& other) = delete;
+  FinalizeCopiedFileTask& operator=(const FinalizeCopiedFileTask& other) =
+      delete;
+
+  const absl::Status& Status() const { return status_; }
+
+  // Task:
+  void ThreadRun(IsCancelledPredicate is_cancelled) override {
+    assert(fp_);
+    fclose(fp_);
+
+    if (!status_.ok()) {
+      // Writing the file failed, nothing to finalize.
+      status_ = WrapStatus(status_, "Failed to write file %s", filepath_);
+      return;
+    }
+
+    // Set file write time.
+    status_ = path::SetFileTime(filepath_, file_.modified_time);
+    if (!status_.ok()) {
+      status_ =
+          WrapStatus(status_, "Failed to set file mod time for %s", filepath_);
+      return;
+    }
+
+    // Set executable bit, but just print warnings as it's not critical.
+    if (is_executable_) {
+      path::Stats stats;
+      status_ = path::GetStats(filepath_, &stats);
+      if (status_.ok()) {
+        status_ = path::ChangeMode(filepath_, stats.mode | kExecutableBits);
+      }
+      if (!status_.ok()) {
+        LOG_WARNING("Failed to set executable bit on '%s': %s", filepath_,
+                    status_.ToString());
+      }
+    }
+  }
+
  private:
-  std::string base_filepath_;
-  std::string target_filepath_;
-  ChangedFileInfo file_;
-  CdcInterface* cdc_;
+  FILE* const fp_ = nullptr;
+  const FileInfo file_;
+  const std::string filepath_;
+  const bool is_executable_;
   absl::Status status_;
 };
 
@@ -160,8 +279,8 @@ bool CdcRsyncServer::CheckComponents(
   }
 
   std::vector<GameletComponent> our_components;
-  status = GameletComponent::Get(
-      {path::Join(component_dir, "cdc_rsync_server")}, &our_components);
+  status = GameletComponent::Get({path::Join(component_dir, kServerFilename)},
+                                 &our_components);
   if (!status.ok() || components != our_components) {
     return false;
   }
@@ -169,28 +288,24 @@ bool CdcRsyncServer::CheckComponents(
   return true;
 }
 
-absl::Status CdcRsyncServer::Run(int port) {
-  absl::Status status = Socket::Initialize();
-  if (!status.ok()) {
-    return WrapStatus(status, "Failed to initialize sockets");
-  }
+absl::Status CdcRsyncServer::Run() {
+  RETURN_IF_ERROR(Socket::Initialize(), "Failed to initialize sockets");
   socket_finalizer_ = std::make_unique<SocketFinalizer>();
 
   socket_ = std::make_unique<ServerSocket>();
-  status = socket_->StartListening(port);
-  if (!status.ok()) {
-    return WrapStatus(status, "Failed to start listening on port %i", port);
-  }
+  int port;
+  ASSIGN_OR_RETURN(port, socket_->StartListening(0),
+                   "Failed to start listening for connections");
   LOG_INFO("cdc_rsync_server listening on port %i", port);
 
   // This is the marker for the client, so it knows it can connect.
-  printf("Server is listening\n");
+  // Print port first so the client can easily parse it when it sees "Server is
+  // listening" without dealing with half-transmitted data.
+  printf("Port %i: Server is listening\n", port);
   fflush(stdout);
 
-  status = socket_->WaitForConnection();
-  if (!status.ok()) {
-    return WrapStatus(status, "Failed to establish a connection");
-  }
+  RETURN_IF_ERROR(socket_->WaitForConnection(),
+                  "Failed to establish a connection");
 
   message_pump_ = std::make_unique<MessagePump>(
       socket_.get(),
@@ -198,7 +313,7 @@ absl::Status CdcRsyncServer::Run(int port) {
   message_pump_->StartMessagePump();
 
   LOG_INFO("Client connected. Starting to sync.");
-  status = Sync();
+  absl::Status status = Sync();
   if (!status.ok()) {
     socket_->ShutdownSendingEnd().IgnoreError();
     return status;
@@ -487,7 +602,7 @@ absl::Status CdcRsyncServer::CreateMissingDirs() {
 template <typename T>
 absl::Status CdcRsyncServer::SendFileIndices(const char* file_type,
                                              const std::vector<T>& files) {
-  LOG_INFO("Sending indices of missing files to client");
+  LOG_INFO("Sending indices of %s files to client", file_type);
   constexpr char error_fmt[] = "Failed to send indices of %s files.";
 
   AddFileIndicesResponse response;
@@ -544,6 +659,8 @@ absl::Status CdcRsyncServer::HandleSendMissingFileData() {
     }
   }
 
+  Threadpool finalize_pool(kNumFinalizerThreads);
+
   for (uint32_t server_index = 0; server_index < diff_.missing_files.size();
        server_index++) {
     const FileInfo& file = diff_.missing_files[server_index];
@@ -563,8 +680,8 @@ absl::Status CdcRsyncServer::HandleSendMissingFileData() {
                         request.server_index(), server_index);
     }
 
-    // Verify that there is no directory existing with the same name.
-    if (path::Exists(filepath) && path::DirExists(filepath)) {
+    // Remove |filepath| if it is a directory.
+    if (path::DirExists(filepath)) {
       assert(!diff_.extraneous_dirs.empty());
       status = path::RemoveFile(filepath);
       if (!status.ok()) {
@@ -613,27 +730,25 @@ absl::Status CdcRsyncServer::HandleSendMissingFileData() {
     }
 
     status = path::StreamWriteFileContents(*fp, handler);
-    fclose(*fp);
-    if (!status.ok()) {
-      return WrapStatus(status, "Failed to write file %s", filepath);
+    finalize_pool.QueueTask(std::make_unique<FinalizeCopiedFileTask>(
+        *fp, file, filepath, is_executable, status));
+    finalize_pool.WaitForQueuedTasksAtMost(kMaxQueueSize);
+
+    // Drain finalize pool for the last file.
+    if (server_index + 1 == diff_.missing_files.size()) {
+      finalize_pool.Wait();
     }
 
-    // Set file write time.
-    status = path::SetFileTime(filepath, file.modified_time);
-    if (!status.ok()) {
-      return WrapStatus(status, "Failed to set file mod time for %s", filepath);
-    }
-
-    // Set executable bit, but just print warnings as it's not critical.
-    if (is_executable) {
-      path::Stats stats;
-      status = path::GetStats(filepath, &stats);
-      if (status.ok()) {
-        status = path::ChangeMode(filepath, stats.mode | kExecutableBits);
-      }
-      if (!status.ok()) {
-        LOG_WARNING("Failed to set executable bit on '%s': %s", filepath,
-                    status.ToString());
+    // Check the results of completed tasks.
+    for (std::unique_ptr<Task> task = finalize_pool.TryGetCompletedTask();
+         task != nullptr; task = finalize_pool.TryGetCompletedTask()) {
+      const FinalizeCopiedFileTask* finalize_task =
+          static_cast<FinalizeCopiedFileTask*>(task.get());
+      if (!finalize_task->Status().ok()) {
+        // Close and finish files that have already been copied, so we don't
+        // discard several already copied files because one failed.
+        finalize_pool.Wait();
+        return finalize_task->Status();
       }
     }
   }
@@ -672,11 +787,22 @@ absl::Status CdcRsyncServer::SyncChangedFiles() {
   CdcInterface cdc(message_pump_.get());
 
   // Pipeline sending signatures and patching files:
-  // MAIN THREAD:   Send signatures to client.
-  //                Only sends to the socket.
-  // WORKER THREAD: Receive diffs from client and patch file.
-  //                Only reads from the socket.
-  Threadpool pool(1);
+  // MAIN THREAD:       Send signatures to client.
+  //                    Only sends to the socket.
+  // PATCHER THREAD:    Receive diffs from client and create patch file.
+  //                    Only reads from the socket.
+  // FINALIZER THREADS: Close patched files and finalize them.
+  Threadpool patch_pool(1);
+  Threadpool finalize_pool(kNumFinalizerThreads);
+
+  // Forward finished patch task immediately to finalize pool.
+  patch_pool.SetTaskCompletedCallback(
+      [&finalize_pool](std::unique_ptr<Task> task) {
+        // Spin if there are too many outstanding tasks, in order to limit the
+        // max number of outstanding tasks.
+        finalize_pool.QueueTask(std::move(task));
+        finalize_pool.WaitForQueuedTasksAtMost(kMaxQueueSize);
+      });
 
   for (uint32_t server_index = 0; server_index < diff_.changed_files.size();
        server_index++) {
@@ -702,25 +828,28 @@ absl::Status CdcRsyncServer::SyncChangedFiles() {
     }
 
     // Queue patching task.
-    pool.QueueTask(std::make_unique<PatchTask>(base_filepath, target_filepath,
-                                               file, &cdc));
+    patch_pool.QueueTask(std::make_unique<PatchTask>(
+        base_filepath, target_filepath, file, &cdc));
 
-    // Wait for the last file to finish.
+    // Drain pools for the last file.
     if (server_index + 1 == diff_.changed_files.size()) {
-      pool.Wait();
+      patch_pool.Wait();
+      finalize_pool.Wait();
     }
 
     // Check the results of completed tasks.
-    std::unique_ptr<Task> task = pool.TryGetCompletedTask();
-    while (task) {
-      PatchTask* patch_task = static_cast<PatchTask*>(task.get());
+    for (std::unique_ptr<Task> task = finalize_pool.TryGetCompletedTask();
+         task != nullptr; task = finalize_pool.TryGetCompletedTask()) {
+      const PatchTask* patch_task = static_cast<PatchTask*>(task.get());
       const std::string& task_path = patch_task->File().filepath;
       if (!patch_task->Status().ok()) {
+        // Close and finish files that have already been synced, so we don't
+        // discard several already synced files because one failed.
+        finalize_pool.Wait();
         return WrapStatus(patch_task->Status(), "Failed to patch file '%s'",
                           task_path);
       }
       LOG_INFO("Finished patching file %s", task_path.c_str());
-      task = pool.TryGetCompletedTask();
     }
   }
 

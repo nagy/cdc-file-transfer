@@ -21,11 +21,12 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "common/arch_type.h"
 #include "common/process.h"
 
 namespace cdc_ft {
 
-// Utilities for executing remote commands on a gamelet through SSH.
+// Utilities for executing remote commands on a remote device through SSH.
 // Windows-only.
 class RemoteUtil {
  public:
@@ -39,44 +40,92 @@ class RemoteUtil {
              ProcessFactory* process_factory, bool forward_output_to_log);
 
   // Sets the SCP command binary path and additional arguments, e.g.
-  //   C:\path\to\scp.exe -p 1234 -i <key_file> -oUserKnownHostsFile=known_hosts
-  // By default, searches scp.exe on the path environment variables.
+  //   C:\path\to\scp.exe -P 1234 -i <key_file> -oUserKnownHostsFile=known_hosts
+  // By default, searches scp on the path environment variables.
   void SetScpCommand(std::string scp_command);
 
+  // Sets the SFTP command binary path and additional arguments, e.g.
+  //   C:\path\to\sftp.exe -P 1234 -i <key_file>
+  //   -oUserKnownHostsFile=known_hosts
+  // By default, searches sftp on the path environment variables.
+  void SetSftpCommand(std::string sftp_command);
+
   // Sets the SSH command binary path and additional arguments, e.g.
-  //   C:\path\to\ssh.exe -P 1234 -i <key_file> -oUserKnownHostsFile=known_hosts
-  // By default, searches ssh.exe on the path environment variables.
+  //   C:\path\to\ssh.exe -p 1234 -i <key_file> -oUserKnownHostsFile=known_hosts
+  // By default, searches ssh on the path environment variables.
   void SetSshCommand(std::string ssh_command);
 
-  // Copies |source_filepaths| to the remote folder |dest| on the gamelet using
-  // scp. If |compress| is true, compressed upload is used.
+  // Converts an scp command into an sftp command by simply replacing the first
+  // occurrance of "scp.", "scp " or "scp\0" by sftp (case insensitive). This
+  // adds backwards compatibility after a switch from scp to sftp in case users
+  // still set CDC_SCP_COMMAND or --scp-command. Luckily, all relevant
+  // parameters of sftp and scp match.
+  // Returns an empty string if |scp_command| does not contain "scp".
+  // Returns bad results for tricky strings like "C:\scp.path\scp.exe".
+  static std::string ScpToSftpCommand(std::string scp_command);
+
+  // Copies |source_filepaths| to the remote folder |dest| on the remove device
+  // using scp. If |compress| is true, compressed upload is used.
   absl::Status Scp(std::vector<std::string> source_filepaths,
                    const std::string& dest, bool compress);
 
-  // Calls 'chmod |mode| |remote_path|' on the gamelet.
+  // Creates an sftp connection to the remote instance and executes the
+  // newline-separated SFTP |commands|. See
+  //   https://man7.org/linux/man-pages/man1/sftp.1.html
+  // for a list of available commands.
+  // |initial_local_dir| sets the initial local directory in sftp. This is
+  // useful since some sftp clients don't work with standard Windows paths and
+  // require for instance /cygdrive paths.
+  // If |compress| is true, compressed upload is used.
+  // Example: Create nested directories and copying an executable file.
+  //   -mkdir a
+  //   cd a
+  //   -mkdir b
+  //   cd b
+  //   put foo_executable
+  //   chmod 755 foo_executable
+  absl::Status Sftp(const std::string& commands,
+                    const std::string& initial_local_dir, bool compress);
+
+  // Calls 'chmod |mode| |remote_path|' on the remote device.
   absl::Status Chmod(const std::string& mode, const std::string& remote_path,
                      bool quiet = false);
 
-  // Runs |remote_command| on the gamelet. The command must be properly escaped.
-  // |name| is the name of the command displayed in the logs.
-  absl::Status Run(std::string remote_command, std::string name);
+  // Runs |remote_command| on the remote device. The command must be properly
+  // escaped. |name| is the name of the command displayed in the logs.
+  // |remote_arch_type| is the arch type of the remote device. It determines
+  // which type of pseudo console is used (-T on Windows, -tt on Linux). If the
+  // wrong arch type is passed, output might be corrupted, but otherwise the
+  // command will work.
+  absl::Status Run(std::string remote_command, std::string name,
+                   ArchType remote_arch_type);
 
-  // Builds an SSH command that executes |remote_command| on the gamelet.
-  ProcessStartInfo BuildProcessStartInfoForSsh(std::string remote_command);
+  // Same as Run(), but captures both stdout and stderr.
+  // If |std_out| or |std_err| are nullptr, the output is not captured.
+  // |remote_arch_type| is the arch type of the remote device, see Run().
+  absl::Status RunWithCapture(std::string remote_command, std::string name,
+                              std::string* std_out, std::string* std_err,
+                              ArchType remote_arch_type);
 
-  // Builds an SSH command that runs SSH port forwarding to the gamelet, using
-  // the given |local_port| and |remote_port|.
-  // If |reverse| is true, sets up reverse port forwarding.
+  // Builds an SSH command that executes |remote_command| on the remote device.
+  // |remote_arch_type| is the arch type of the remote device, see Run().
+  ProcessStartInfo BuildProcessStartInfoForSsh(std::string remote_command,
+                                               ArchType remote_arch_type);
+
+  // Builds an SSH command that runs SSH port forwarding to the remote device,
+  // using the given |local_port| and |remote_port|. If |reverse| is true, sets
+  // up reverse port forwarding.
   ProcessStartInfo BuildProcessStartInfoForSshPortForward(int local_port,
                                                           int remote_port,
                                                           bool reverse);
 
-  // Builds an SSH command that executes |remote_command| on the gamelet, using
-  // port forwarding with given |local_port| and |remote_port|.
-  // If |reverse| is true, sets up reverse port forwarding.
+  // Builds an SSH command that executes |remote_command| on the remote device,
+  // using port forwarding with given |local_port| and |remote_port|. If
+  // |reverse| is true, sets up reverse port forwarding.
+  // |remote_arch_type| is the arch type of the remote device, see Run().
   ProcessStartInfo BuildProcessStartInfoForSshPortForwardAndCommand(
-      int local_port, int remote_port, bool reverse,
-      std::string remote_command);
+      int local_port, int remote_port, bool reverse, std::string remote_command,
+      ArchType remote_arch_type);
 
   // Returns whether output is suppressed.
   bool Quiet() const { return quiet_; }
@@ -107,7 +156,8 @@ class RemoteUtil {
  private:
   // Common code for BuildProcessStartInfoForSsh*.
   ProcessStartInfo BuildProcessStartInfoForSshInternal(
-      std::string forward_arg, std::string remote_command);
+      std::string forward_arg, std::string remote_command,
+      ArchType remote_arch_type);
 
   const int verbosity_;
   const bool quiet_;
@@ -115,6 +165,7 @@ class RemoteUtil {
   const bool forward_output_to_log_;
 
   std::string scp_command_ = "scp";
+  std::string sftp_command_ = "sftp";
   std::string ssh_command_ = "ssh";
   std::string user_host_;
 };

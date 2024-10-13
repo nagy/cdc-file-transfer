@@ -3,6 +3,40 @@ load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "ansi_filter",
+    srcs = ["ansi_filter.cc"],
+    hdrs = ["ansi_filter.h"],
+)
+
+cc_test(
+    name = "ansi_filter_test",
+    srcs = ["ansi_filter_test.cc"],
+    deps = [
+        ":ansi_filter",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "arch_type",
+    srcs = ["arch_type.cc"],
+    hdrs = ["arch_type.h"],
+    deps = [":platform"],
+)
+
+cc_test(
+    name = "arch_type_test",
+    srcs = ["arch_type_test.cc"],
+    deps = [
+        ":arch_type",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "buffer",
     srcs = ["buffer.cc"],
     hdrs = ["buffer.h"],
@@ -15,6 +49,35 @@ cc_test(
         ":buffer",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "build_version",
+    srcs = ["build_version.cc"],
+    hdrs = ["build_version.h"],
+    # This definition should be replaced by release flow.
+    copts = ["-DCDC_BUILD_VERSION=DEV"],
+)
+
+cc_library(
+    name = "client_socket",
+    srcs = [
+        "client_socket.cc",
+        "socket_internal.h",
+    ],
+    hdrs = ["client_socket.h"],
+    linkopts = select({
+        "//tools:windows": [
+            "/DEFAULTLIB:Ws2_32.lib",  # Sockets, e.g. recv, send, WSA*.
+        ],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":log",
+        ":socket",
+        ":status",
+        ":util",
     ],
 )
 
@@ -86,6 +149,16 @@ cc_test(
 )
 
 cc_library(
+    name = "fake_socket",
+    srcs = ["fake_socket.cc"],
+    hdrs = ["fake_socket.h"],
+    deps = [
+        ":socket",
+        "@com_google_absl//absl/status",
+    ],
+)
+
+cc_library(
     name = "file_watcher",
     srcs = [
         "file_watcher_win.cc",
@@ -142,6 +215,7 @@ cc_library(
     deps = [
         ":clock",
         ":platform",
+        ":stopwatch",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
     ],
@@ -232,6 +306,7 @@ cc_library(
     hdrs = ["port_manager.h"],
     target_compatible_with = ["@platforms//os:windows"],
     deps = [
+        ":arch_type",
         ":remote_util",
         ":status",
         ":stopwatch",
@@ -338,6 +413,7 @@ cc_library(
     srcs = ["remote_util.cc"],
     hdrs = ["remote_util.h"],
     deps = [
+        ":arch_type",
         ":platform",
         ":process",
         ":sdk_util",
@@ -379,6 +455,7 @@ cc_library(
         ":path",
         ":platform",
         ":status",
+        "//common:build_version",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings:str_format",
     ],
@@ -393,6 +470,42 @@ cc_test(
         ":status_test_macros",
         ":test_main",
         "@com_google_googletest//:gtest",
+    ],
+)
+
+cc_library(
+    name = "server_socket",
+    srcs = [
+        "server_socket.cc",
+        "socket_internal.h",
+    ],
+    hdrs = ["server_socket.h"],
+    linkopts = select({
+        "//tools:windows": [
+            "/DEFAULTLIB:Ws2_32.lib",  # Sockets, e.g. recv, send, WSA*.
+        ],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":log",
+        ":socket",
+        ":status",
+        ":util",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_library(
+    name = "socket",
+    srcs = ["socket.cc"],
+    hdrs = ["socket.h"],
+    deps = [
+        ":log",
+        ":platform",
+        ":status",
+        ":util",
+        "@com_google_absl//absl/status",
     ],
 )
 

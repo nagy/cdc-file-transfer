@@ -14,6 +14,7 @@
 
 #include "cdc_rsync/base/server_exit_code.h"
 #include "cdc_rsync_server/cdc_rsync_server.h"
+#include "common/build_version.h"
 #include "common/gamelet_component.h"
 #include "common/log.h"
 #include "common/status.h"
@@ -60,33 +61,33 @@ ServerExitCode GetExitCode(const absl::Status& status) {
 }  // namespace cdc_ft
 
 int main(int argc, const char** argv) {
-  if (argc < 2) {
-    printf("Usage: cdc_rsync_server <port> cdc_rsync_server <size> <time> \n");
-    printf("       where <size> and <time> are the file size and modified\n");
-    printf("       timestamp (Unix epoch) of the corresponding component.\n");
-    return cdc_ft::kServerExitCodeGenericStartup;
-  }
+  if (argc < 5) {
+    printf(R"("cdc_rsync_server - Remote component of cdc_rsync. Version: %s
 
-  int port = atoi(argv[1]);
-  if (port == 0) {
-    SendErrorMessage(absl::StrFormat("Invalid port '%s'", argv[1]).c_str());
+Usage: cdc_rsync_server <build_version> cdc_rsync_server <size> <modified_time>
+       <build_version>            build version embedded in the component
+       <size>                     file size of the component
+       <modified_time>            timestamp (Unix epoch) of the component)",
+           BUILD_VERSION);
+
     return cdc_ft::kServerExitCodeGenericStartup;
   }
 
   // The rest is expected to be sets of gamelet component info consisting of
-  // (filename, filesize, modified_time). This is used check whether the
+  // (version, filename, size, modified_time). This is used check whether the
   // components are up-to-date.
   std::vector<cdc_ft::GameletComponent> components =
-      cdc_ft::GameletComponent::FromCommandLineArgs(argc - 2, argv + 2);
+      cdc_ft::GameletComponent::FromCommandLineArgs(argc - 1, argv + 1);
 
   cdc_ft::Log::Initialize(
       std::make_unique<cdc_ft::ConsoleLog>(cdc_ft::LogLevel::kWarning));
   cdc_ft::CdcRsyncServer server;
+
   if (!server.CheckComponents(components)) {
     return cdc_ft::kServerExitCodeOutOfDate;
   }
 
-  absl::Status status = server.Run(port);
+  absl::Status status = server.Run();
   if (status.ok()) {
     return 0;
   }

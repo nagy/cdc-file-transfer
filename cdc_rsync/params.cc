@@ -19,8 +19,10 @@
 #include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
+#include "common/build_version.h"
 #include "common/path.h"
 #include "common/port_range_parser.h"
+#include "common/remote_util.h"
 #include "lib/zstd.h"
 
 namespace cdc_ft {
@@ -37,22 +39,22 @@ void PrintError(const absl::FormatSpec<Args...>& format, Args... args) {
 enum class OptionResult { kConsumedKey, kConsumedKeyValue, kError };
 
 const char kHelpText[] =
-    R"(Copy local files to a gamelet
-
-Synchronizes local files and files on a gamelet. Matching files are skipped.
-For partially matching files only the deltas are transferred.
+    R"(
+Matching files are skipped based on file size and modified time. For partially
+matching files only the differences are transferred. The destination directory
+can be the same Windows machine or a remote Windows or Linux device.
 
 Usage:
-  cdc_rsync [options] source [source]... [user@]host:destination
+  cdc_rsync [options] source [source]... [[user@]host:]destination
 
 Parameters:
-  source                    Local file or directory to be copied
+  source                    Local file or directory to be copied or synced
   user                      Remote SSH user name
   host                      Remote host or IP address
-  destination               Remote destination directory
+  destination               Local or remote destination directory
 
 Options:
-    --contimeout sec        Gamelet connection timeout in seconds (default: 10)
+    --contimeout sec        Remote connection timeout in seconds (default: 10)
 -q, --quiet                 Quiet mode, only print errors
 -v, --verbose               Increase output verbosity
     --json                  Print JSON progress
@@ -75,22 +77,23 @@ Options:
     --ssh-command <cmd>     Path and arguments of ssh command to use, e.g.
                             "C:\path\to\ssh.exe -p 12345 -i id_rsa -oUserKnownHostsFile=known_hosts"
                             Can also be specified by the CDC_SSH_COMMAND environment variable.
-    --scp-command <cmd>     Path and arguments of scp command to use, e.g.
-                            "C:\path\to\scp.exe -P 12345 -i id_rsa -oUserKnownHostsFile=known_hosts"
-                            Can also be specified by the CDC_SCP_COMMAND environment variable.
-    --forward-port <port>   TCP port or range used for SSH port forwarding (default: 44450-44459).
-                            If a range is specified, searches for available ports (slower).
--h  --help                  Help for cdc_rsync
+    --sftp-command <cmd>    Path and arguments of sftp command to use, e.g.
+                            "C:\path\to\sftp.exe -P 12345 -i id_rsa -oUserKnownHostsFile=known_hosts"
+                            Can also be specified by the CDC_SFTP_COMMAND environment variable.
+-h, --help                  Help for cdc_rsync
 )";
 
 constexpr char kSshCommandEnvVar[] = "CDC_SSH_COMMAND";
 constexpr char kScpCommandEnvVar[] = "CDC_SCP_COMMAND";
+constexpr char kSftpCommandEnvVar[] = "CDC_SFTP_COMMAND";
 
 // Populates some parameters from environment variables.
 void PopulateFromEnvVars(Parameters* parameters) {
   path::GetEnv(kSshCommandEnvVar, &parameters->options.ssh_command)
       .IgnoreError();
-  path::GetEnv(kScpCommandEnvVar, &parameters->options.scp_command)
+  path::GetEnv(kScpCommandEnvVar, &parameters->options.deprecated_scp_command)
+      .IgnoreError();
+  path::GetEnv(kSftpCommandEnvVar, &parameters->options.sftp_command)
       .IgnoreError();
 }
 
@@ -287,21 +290,22 @@ OptionResult HandleParameter(const std::string& key, const char* value,
   }
 
   if (key == "scp-command") {
+    // Backwards compatibility. Note that this flag is hidden from the help.
     if (!ValidateValue(key, value)) return OptionResult::kError;
-    params->options.scp_command = value;
+    params->options.deprecated_scp_command = value;
+    return OptionResult::kConsumedKeyValue;
+  }
+
+  if (key == "sftp-command") {
+    if (!ValidateValue(key, value)) return OptionResult::kError;
+    params->options.sftp_command = value;
     return OptionResult::kConsumedKeyValue;
   }
 
   if (key == "forward-port") {
-    if (!ValidateValue(key, value)) return OptionResult::kError;
-    uint16_t first, last;
-    if (!port_range::Parse(value, &first, &last)) {
-      PrintError("Failed to parse %s=%s, expected <port> or <port1>-<port2>",
-                 key, value);
-      return OptionResult::kError;
-    }
-    params->options.forward_port_first = first;
-    params->options.forward_port_last = last;
+    // This param is no longer needed. Just print a warning for backwards
+    // compatibility.
+    std::cout << "--forward-port argument no longer needed" << std::endl;
     return OptionResult::kConsumedKeyValue;
   }
 
@@ -311,6 +315,8 @@ OptionResult HandleParameter(const std::string& key, const char* value,
 
 bool ValidateParameters(const Parameters& params, bool help) {
   if (help) {
+    std::cout << "cdc_rsync - Synchronize files and directories. Version: "
+              << BUILD_VERSION << "\n";
     std::cout << kHelpText;
     return false;
   }
@@ -364,14 +370,6 @@ bool ValidateParameters(const Parameters& params, bool help) {
     return false;
   }
 
-  if (params.user_host.empty()) {
-    PrintError(
-        "No remote host specified in destination '%s'. "
-        "Expected [user@]host:destination.",
-        params.destination);
-    return false;
-  }
-
   return true;
 }
 
@@ -397,15 +395,14 @@ bool CheckOptionResult(OptionResult result, const std::string& name,
 // afterward and |user_host| is |user@foo.com|. Does not touch Windows drives,
 // e.g. C:\foo.
 void PopUserHost(std::string* destination, std::string* user_host) {
+  user_host->clear();
+
+  // Don't mistake the C part of C:\foo or \\share\C:\foo as user/host.
+  if (!path::GetDrivePrefix(*destination).empty()) return;
+
   std::vector<std::string> parts =
       absl::StrSplit(*destination, absl::MaxSplits(':', 1));
   if (parts.size() < 2) return;
-
-  // Don't mistake the C part of C:\foo as user/host.
-  if (parts[0].size() == 1 && toupper(parts[0][0]) >= 'A' &&
-      toupper(parts[0][0]) <= 'Z') {
-    return;
-  }
 
   *user_host = parts[0];
   *destination = parts[1];
@@ -490,6 +487,27 @@ bool Parse(int argc, const char* const* argv, Parameters* parameters) {
   }
 
   PopUserHost(&parameters->destination, &parameters->user_host);
+
+  // Backwards compabitility after switching to sftp. Convert scp to sftp
+  // command Note that this flag is hidden from the help.
+  if (parameters->options.sftp_command.empty() &&
+      !parameters->options.deprecated_scp_command.empty()) {
+    LOG_WARNING(
+        "The CDC_SCP_COMMAND environment variable and the --scp-command flag "
+        "are deprecated. Please set CDC_SFTP_COMMAND or --sftp-command "
+        "instead.");
+
+    parameters->options.sftp_command = RemoteUtil::ScpToSftpCommand(
+        parameters->options.deprecated_scp_command);
+    if (!parameters->options.sftp_command.empty()) {
+      LOG_WARNING("Converted scp command '%s' to sftp command '%s'.",
+                  parameters->options.deprecated_scp_command,
+                  parameters->options.sftp_command);
+    } else {
+      LOG_WARNING("Failed to convert scp command '%s' to sftp command.",
+                  parameters->options.deprecated_scp_command);
+    }
+  }
 
   if (!ValidateParameters(*parameters, help)) {
     return false;

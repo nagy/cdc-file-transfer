@@ -12,90 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "cdc_rsync_server/server_socket.h"
+#include "common/server_socket.h"
 
 #include "common/log.h"
-#include "common/platform.h"
+#include "common/socket_internal.h"
 #include "common/status.h"
-#include "common/util.h"
-
-#if PLATFORM_WINDOWS
-
-#include <winsock2.h>
-
-#elif PLATFORM_LINUX
-
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-#include <cerrno>
-
-#endif
 
 namespace cdc_ft {
-namespace {
-
-#if PLATFORM_WINDOWS
-
-using SocketType = SOCKET;
-using SockAddrType = SOCKADDR;
-constexpr SocketType kInvalidSocket = INVALID_SOCKET;
-constexpr int kSocketError = SOCKET_ERROR;
-constexpr int kSendingEnd = SD_SEND;
-
-constexpr int kErrAgain = WSAEWOULDBLOCK;  // There's no EAGAIN on Windows.
-constexpr int kErrWouldBlock = WSAEWOULDBLOCK;
-constexpr int kErrAddrInUse = WSAEADDRINUSE;
-
-int GetLastError() { return WSAGetLastError(); }
-std::string GetErrorStr(int err) { return Util::GetWin32Error(err); }
-void Close(SocketType* socket) {
-  if (*socket != kInvalidSocket) {
-    closesocket(*socket);
-    *socket = kInvalidSocket;
-  }
-}
-
-// Not necessary on Windows.
-#define HANDLE_EINTR(x) (x)
-
-#elif PLATFORM_LINUX
-
-using SocketType = int;
-using SockAddrType = sockaddr;
-constexpr SocketType kInvalidSocket = -1;
-constexpr int kSocketError = -1;
-constexpr int kSendingEnd = SHUT_WR;
-
-constexpr int kErrAgain = EAGAIN;
-constexpr int kErrWouldBlock = EWOULDBLOCK;
-constexpr int kErrAddrInUse = EADDRINUSE;
-
-int GetLastError() { return errno; }
-std::string GetErrorStr(int err) { return strerror(err); }
-void Close(SocketType* socket) {
-  if (*socket != kInvalidSocket) {
-    close(*socket);
-    *socket = kInvalidSocket;
-  }
-}
-
-// Keep re-evaluating the expression |x| while it returns EINTR.
-#define HANDLE_EINTR(x)                                     \
-  ({                                                        \
-    decltype(x) eintr_wrapper_result;                       \
-    do {                                                    \
-      eintr_wrapper_result = (x);                           \
-    } while (eintr_wrapper_result == -1 && errno == EINTR); \
-    eintr_wrapper_result;                                   \
-  })
-
-#endif
-
-std::string GetLastErrorStr() { return GetErrorStr(GetLastError()); }
-
-}  // namespace
 
 struct ServerSocketInfo {
   // Listening socket file descriptor (where new connections are accepted).
@@ -113,15 +36,63 @@ ServerSocket::~ServerSocket() {
   StopListening();
 }
 
-absl::Status ServerSocket::StartListening(int port) {
+// static
+absl::StatusOr<int> ServerSocket::FindAvailablePort() {
+  ServerSocket socket;
+  return socket.StartListening(0);
+}
+
+absl::StatusOr<int> ServerSocket::StartListening(int port) {
   if (socket_info_->listen_sock != kInvalidSocket) {
     return MakeStatus("Already listening");
   }
 
-  LOG_DEBUG("Open socket");
-  socket_info_->listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+  // Find addrinfos suitable for listening via IPV4 and IPV6.
+  addrinfo hints;
+  addrinfo* addr_infos = nullptr;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = PF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
+  // AI_PASSIVE indicates that the addresses are used with bind(). The returned
+  // addresses will be the unspecified addresses for each family.
+  hints.ai_flags = AI_NUMERICHOST | AI_PASSIVE;
+  int result = getaddrinfo(/*address=*/nullptr, std::to_string(port).c_str(),
+                           &hints, &addr_infos);
+  if (result != 0) {
+    return MakeStatus("Getting address infos failed: %s", GetLastErrorStr());
+  }
+  AddrInfoReleaser releaser(addr_infos);
+
+  // Prefer IPV6 sockets. They can also accept IPV4 connections.
+  for (addrinfo* curr = addr_infos; curr; curr = curr->ai_next) {
+    if (curr->ai_family == PF_INET6) {
+      return StartListeningInternal(port, curr);
+    }
+  }
+
+  // Fall back to IPV4 sockets.
+  for (addrinfo* curr = addr_infos; curr; curr = curr->ai_next) {
+    if (curr->ai_family == PF_INET) {
+      return StartListeningInternal(port, curr);
+    }
+  }
+
+  return MakeStatus("No IPV4 and IPV6 network addresses available");
+}
+
+absl::StatusOr<int> ServerSocket::StartListeningInternal(int port,
+                                                         addrinfo* addr) {
+  assert(addr->ai_family == PF_INET || addr->ai_family == PF_INET6);
+  const char* family = addr->ai_family == PF_INET ? "IPV4" : "IPV6";
+
+  // Open a socket with the correct address family for this address.
+  LOG_DEBUG("Open %s listen socket", family);
+  socket_info_->listen_sock =
+      socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
   if (socket_info_->listen_sock == kInvalidSocket) {
-    return MakeStatus("Creating listen socket failed: %s", GetLastErrorStr());
+    return MakeStatus("Creating %s listen socket failed: %s", family,
+                      GetLastErrorStr());
   }
 
   // If the program terminates abnormally, the socket might remain in a
@@ -136,16 +107,21 @@ absl::Status ServerSocket::StartListening(int port) {
     LOG_DEBUG("Enabling address reusal failed");
   }
 
-  LOG_DEBUG("Bind socket");
-  sockaddr_in serv_addr;
-  memset(&serv_addr, 0, sizeof(serv_addr));
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_addr.s_addr = INADDR_ANY;
-  serv_addr.sin_port = htons(port);
+  // Allow ipv4 connections on the ipv6 socket. By default, ipv6 sockets only
+  // allow ipv4 connections on Windows.
+  if (addr->ai_family == PF_INET6) {
+    const int disable = 0;
+    result =
+        setsockopt(socket_info_->listen_sock, IPPROTO_IPV6, IPV6_V6ONLY,
+                   reinterpret_cast<const char*>(&disable), sizeof(disable));
+    if (result == kSocketError) {
+      LOG_DEBUG("Disabling IPV6-only failed");
+    }
+  }
 
-  result = bind(socket_info_->listen_sock,
-                reinterpret_cast<const SockAddrType*>(&serv_addr),
-                sizeof(serv_addr));
+  LOG_DEBUG("Bind socket");
+  result = bind(socket_info_->listen_sock, addr->ai_addr,
+                static_cast<int>(addr->ai_addrlen));
   if (result == kSocketError) {
     int err = GetLastError();
     absl::Status status =
@@ -159,6 +135,21 @@ absl::Status ServerSocket::StartListening(int port) {
     return status;
   }
 
+  if (port == 0) {
+    // Find out which port was auto-selected.
+    socklen_t len = addr->ai_addrlen;
+    result = getsockname(socket_info_->listen_sock, addr->ai_addr, &len);
+    if (result == kSocketError) {
+      Close(&socket_info_->listen_sock);
+      return MakeStatus("Getting port failed: %s", GetLastErrorStr());
+    }
+    if (addr->ai_family == PF_INET) {
+      port = ntohs(reinterpret_cast<sockaddr_in*>(addr->ai_addr)->sin_port);
+    } else if (addr->ai_family == PF_INET6) {
+      port = ntohs(reinterpret_cast<sockaddr_in6*>(addr->ai_addr)->sin6_port);
+    }
+  }
+
   LOG_DEBUG("Listen");
   result = listen(socket_info_->listen_sock, 1);
   if (result == kSocketError) {
@@ -167,17 +158,20 @@ absl::Status ServerSocket::StartListening(int port) {
     return MakeStatus("Listening to socket failed: %s", GetErrorStr(err));
   }
 
-  return absl::OkStatus();
+  return port;
 }
 
 void ServerSocket::StopListening() {
   Close(&socket_info_->listen_sock);
-  LOG_INFO("Stopped listening.");
+  LOG_DEBUG("Stopped listening.");
 }
 
 absl::Status ServerSocket::WaitForConnection() {
   if (socket_info_->conn_sock != kInvalidSocket) {
     return MakeStatus("Already connected");
+  }
+  if (socket_info_->listen_sock == kInvalidSocket) {
+    return MakeStatus("Not listening");
   }
 
   socket_info_->conn_sock = accept(socket_info_->listen_sock, nullptr, nullptr);
@@ -191,7 +185,7 @@ absl::Status ServerSocket::WaitForConnection() {
 
 void ServerSocket::Disconnect() {
   Close(&socket_info_->conn_sock);
-  LOG_INFO("Disconnected");
+  LOG_DEBUG("Disconnected");
 }
 
 absl::Status ServerSocket::ShutdownSendingEnd() {

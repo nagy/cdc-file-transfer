@@ -1,8 +1,8 @@
 # CDC File Transfer
 
 Born from the ashes of Stadia, this repository contains tools for syncing and
-streaming files from Windows to Linux. They are based on Content Defined
-Chunking (CDC), in particular
+streaming files from Windows to Windows or Linux. The tools are based on Content
+Defined Chunking (CDC), in particular
 [FastCDC](https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia),
 to split up files into chunks.
 
@@ -132,9 +132,9 @@ difference operation. It does not involve a per-byte hash map lookup.
 
 ## CDC Stream
 
-`cdc_stream` is a tool to stream files and directories from a Windows machine to a
-Linux device. Conceptually, it is similar to [sshfs](https://github.com/libfuse/sshfs),
-but it is optimized for read speed.
+`cdc_stream` is a tool to stream files and directories from a Windows machine to
+a Linux device. Conceptually, it is similar to
+[sshfs](https://github.com/libfuse/sshfs), but it is optimized for read speed.
 * It caches streamed data on the Linux device.
 * If a file is re-read on Linux after it changed on Windows, only the
   differences are streamed again. The rest is read from the cache.
@@ -161,18 +161,48 @@ In one case, the game is streamed via `sshfs`, in the other case we use
   <img src="docs/cdc_stream_vs_sshfs.png" alt="Comparison of cdc_stream and sshfs" width="752" />
 </p>
 
+# Supported Platforms
+
+| `cdc_rsync`                  | From                 | To                   |
+|:-----------------------------|:--------------------:|:--------------------:|
+| Windows x86_64               | &check;              | &check; <sup>1</sup> |
+| Ubuntu 22.04 x86_64          | &cross; <sup>2</sup> | &check;              |
+| Ubuntu 22.04 aarch64         | &cross;              | &cross;              |
+| macOS 13 x86_64 <sup>3</sup> | &cross;              | &cross;              |
+| macOS 13 aarch64 <sup>3</sup>| &cross;              | &cross;              |
+
+| `cdc_stream`                 | From                 | To                   |
+|:-----------------------------|:--------------------:|:--------------------:|
+| Windows x86_64               | &check;              | &cross;              |
+| Ubuntu 22.04 x86_64          | &cross;              | &check;              |
+| Ubuntu 22.04 aarch64         | &cross;              | &cross;              |
+| macOS 13 x86_64 <sup>3</sup> | &cross;              | &cross;              |
+| macOS 13 aarch64 <sup>3</sup>| &cross;              | &cross;              |
+
+<span style="font-size: 0.8rem">
+
+<sup>1</sup> Only local syncs, e.g. `cdc_rsync C:\src\* C:\dst`. Support for
+remote syncs is being added, see
+[#61](https://github.com/google/cdc-file-transfer/issues/61).  
+<sup>2</sup> See [#56](https://github.com/google/cdc-file-transfer/issues/56).  
+<sup>3</sup> See [#62](https://github.com/google/cdc-file-transfer/issues/62).
+
+</span>
+
 # Getting Started
 
 Download the precompiled binaries from the
-[latest release](https://github.com/google/cdc-file-transfer/releases).
-We currently provide Linux binaries compiled on
+[latest release](https://github.com/google/cdc-file-transfer/releases) to a
+Windows device and unzip them. The Linux binaries are automatically deployed
+to `~/.cache/cdc-file-transfer` by the Windows tools. There is no need to manually
+deploy them. We currently provide Linux binaries compiled on
 [Github's latest Ubuntu](https://github.com/actions/runner-images) version.
 If the binaries work for you, you can skip the following two sections.
 
 Alternatively, the project can be built from source. Some binaries have to be
 built on Windows, some on Linux.
 
-## Prerequisites
+## Prerequisites for Building
 
 To build the tools from source, the following steps have to be executed on
 **both Windows and Linux**.
@@ -190,61 +220,59 @@ To build the tools from source, the following steps have to be executed on
   git submodule update --init --recursive
   ```
 
-Finally, install an SSH client on the Windows device if not present.
-The file transfer tools require `ssh.exe` and `scp.exe`.
+Finally, install an SSH client on the Windows machine if not present.
+The file transfer tools require `ssh.exe` and `sftp.exe`.
 
 ## Building
 
-The two tools can be built and used independently.
+The two tools CDC RSync and CDC Stream can be built and used independently.
 
 ### CDC RSync
 
-* Build Linux components
+* On a Linux device, build the Linux components
   ```
   bazel build --config linux --compilation_mode=opt --linkopt=-Wl,--strip-all --copt=-fdata-sections --copt=-ffunction-sections --linkopt=-Wl,--gc-sections //cdc_rsync_server
   ```
-* Build Windows components
+* On a Windows device, build the Windows components
   ```
   bazel build --config windows --compilation_mode=opt --copt=/GL //cdc_rsync
   ```
 * Copy the Linux build output file `cdc_rsync_server` from 
-  `bazel-bin/cdc_rsync_server` on the Linux system to `bazel-bin\cdc_rsync`
-  on the Windows machine.
+  `bazel-bin/cdc_rsync_server` to `bazel-bin\cdc_rsync` on the Windows machine.
 
 ### CDC Stream
 
-* Build Linux components
+* On a Linux device, build the Linux components
   ```
   bazel build --config linux --compilation_mode=opt --linkopt=-Wl,--strip-all --copt=-fdata-sections --copt=-ffunction-sections --linkopt=-Wl,--gc-sections //cdc_fuse_fs
   ```
-* Build Windows components
+* On a Windows device, build the Windows components
   ```
   bazel build --config windows --compilation_mode=opt --copt=/GL //cdc_stream
   ```
 * Copy the Linux build output files `cdc_fuse_fs` and `libfuse.so` from 
-  `bazel-bin/cdc_fuse_fs` on the Linux system to `bazel-bin\cdc_stream`
-  on the Windows machine.
+  `bazel-bin/cdc_fuse_fs` to `bazel-bin\cdc_stream` on the Windows machine.
 
 ## Usage
 
-The tools require a setup where you can use SSH and SCP from the Windows machine
-to the Linux device without entering a password, e.g. by using key-based
+The tools require a setup where you can use SSH and SFTP from the Windows
+machine to the Linux device without entering a password, e.g. by using key-based
 authentication.
 
-### Configuring SSH and SCP
+### Configuring SSH and SFTP
 
-By default, the tools search `ssh.exe` and `scp.exe` from the path environment
+By default, the tools search `ssh.exe` and `sftp.exe` from the path environment
 variable. If you can run the following commands in a Windows cmd without
 entering your password, you are all set:
 ```
 ssh user@linux.device.com
-scp somefile.txt user@linux.device.com:
+sftp user@linux.device.com
 ```
 Here, `user` is the Linux user and `linux.device.com` is the Linux host to
 SSH into or copy the file to.
 
 If additional arguments are required, it is recommended to provide an SSH config
-file. By default, both `ssh.exe` and `scp.exe` use the file at
+file. By default, both `ssh.exe` and `sftp.exe` use the file at
 `%USERPROFILE%\.ssh\config` on Windows, if it exists. A possible config file
 that sets a username, a port, an identity file and a known host file could look
 as follows:
@@ -256,21 +284,21 @@ Host linux_device
 	IdentityFile C:\path\to\id_rsa
 	UserKnownHostsFile C:\path\to\known_hosts
 ```
-If `ssh.exe` or `scp.exe` cannot be found, you can specify the full paths via
-the command line arguments `--ssh-command` and `--scp-command` for `cdc_rsync`
+If `ssh.exe` or `sftp.exe` cannot be found, you can specify the full paths via
+the command line arguments `--ssh-command` and `--sftp-command` for `cdc_rsync`
 and `cdc_stream start` (see below), or set the environment variables
-`CDC_SSH_COMMAND` and `CDC_SCP_COMMAND`, e.g.
+`CDC_SSH_COMMAND` and `CDC_SFTP_COMMAND`, e.g.
 ```
 set CDC_SSH_COMMAND="C:\path with space\to\ssh.exe"
-set CDC_SCP_COMMAND="C:\path with space\to\scp.exe"
+set CDC_SFTP_COMMAND="C:\path with space\to\sftp.exe"
 ```
 Note that you can also specify SSH configuration via the environment variables
 instead of using a config file:
 ```
 set CDC_SSH_COMMAND=C:\path\to\ssh.exe -p 12345 -i C:\path\to\id_rsa -oUserKnownHostsFile=C:\path\to\known_hosts
-set CDC_SCP_COMMAND=C:\path\to\scp.exe -P 12345 -i C:\path\to\id_rsa -oUserKnownHostsFile=C:\path\to\known_hosts
+set CDC_SFTP_COMMAND=C:\path\to\sftp.exe -P 12345 -i C:\path\to\id_rsa -oUserKnownHostsFile=C:\path\to\known_hosts
 ```
-Note the small `-p` for `ssh.exe` and the capital `-P` for `scp.exe`.
+Note the small `-p` for `ssh.exe` and the capital `-P` for `sftp.exe`.
 
 #### Google Specific
 
@@ -278,7 +306,7 @@ For Google internal usage, set the following environment variables to enable SSH
 authentication using a Google security key:
 ```
 set CDC_SSH_COMMAND=C:\gnubby\bin\ssh.exe
-set CDC_SCP_COMMAND=C:\gnubby\bin\scp.exe
+set CDC_SFTP_COMMAND=C:\gnubby\bin\sftp.exe
 ```
 Note that you will have to touch the security key multiple times during the
 first run. Subsequent runs only require a single touch.
@@ -303,6 +331,10 @@ cdc_rsync C:\path\to\assets\* user@linux.device.com:~/assets -r
 To get per file progress, add `-v`:
 ```
 cdc_rsync C:\path\to\assets\* user@linux.device.com:~/assets -vr
+```
+The tool also supports local syncs:
+```
+cdc_rsync C:\path\to\assets\* C:\path\to\destination -vr
 ```
 
 ### CDC Stream
@@ -352,7 +384,7 @@ instead of to the file.
 `cdc_rsync` always logs to the console. To increase log verbosity, pass `-vvv`
 for debug logs or `-vvvv` for verbose logs.
 
-For both sync and stream, the debug logs contain all SSH and SCP commands that
+For both sync and stream, the debug logs contain all SSH and SFTP commands that
 are attempted to run, which is very useful for troubleshooting. If a command
 fails unexpectedly, copy it and run it in isolation. Pass `-vv` or `-vvv` for
 additional debug output.

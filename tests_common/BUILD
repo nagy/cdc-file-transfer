@@ -21,6 +21,8 @@ cc_binary(
         "//common:all_test_data",
     ],
     deps = [
+        "//common:ansi_filter",
+        "//common:arch_type",
         "//common:buffer",
         "//common:dir_iter",
         "//common:file_watcher",

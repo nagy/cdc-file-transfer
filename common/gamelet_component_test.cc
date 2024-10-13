@@ -15,6 +15,7 @@
 #include "common/gamelet_component.h"
 
 #include "absl/strings/str_split.h"
+#include "common/build_version.h"
 #include "common/log.h"
 #include "common/path.h"
 #include "common/status_test_macros.h"
@@ -43,14 +44,14 @@ class GameletComponentTest : public ::testing::Test {
       path::Join(base_dir_, "other", "cdc_rsync_server");
 };
 
-TEST_F(GameletComponentTest, EqualityOperators) {
+TEST_F(GameletComponentTest, EqualityOperators_DevelopmentVersion) {
   constexpr uint64_t size1 = 1001;
   constexpr uint64_t size2 = 1002;
 
   constexpr int64_t modified_time1 = 5001;
   constexpr int64_t modified_time2 = 5002;
 
-  GameletComponent a("file1", size1, modified_time1);
+  GameletComponent a(DEV_BUILD_VERSION, "file1", size1, modified_time1);
 
   GameletComponent b = a;
   EXPECT_TRUE(a == b && !(a != b));
@@ -65,6 +66,38 @@ TEST_F(GameletComponentTest, EqualityOperators) {
   b = a;
   b.modified_time = modified_time2;
   EXPECT_TRUE(!(a == b) && a != b);
+
+  b = a;
+  b.size = size2;
+  b.build_version = "Specified";
+  EXPECT_TRUE(!(a == b) && a != b);
+
+  a.build_version = "Specified";
+  EXPECT_TRUE(a == b && !(a != b));
+}
+
+TEST_F(GameletComponentTest, EqualityOperators_SpecifiedVersion) {
+  constexpr uint64_t size1 = 1001;
+  constexpr uint64_t size2 = 1002;
+
+  constexpr int64_t modified_time1 = 5001;
+  constexpr int64_t modified_time2 = 5002;
+
+  GameletComponent a("Specified", "file1", size1, modified_time1);
+
+  GameletComponent b = a;
+  EXPECT_TRUE(a == b && !(a != b));
+
+  b.filename = "file2";
+  EXPECT_TRUE(!(a == b) && a != b);
+
+  b = a;
+  b.size = size2;
+  EXPECT_TRUE(a == b && !(a != b));
+
+  b = a;
+  b.modified_time = modified_time2;
+  EXPECT_TRUE(a == b && !(a != b));
 }
 
 TEST_F(GameletComponentTest, GetValidComponents) {
@@ -91,9 +124,30 @@ TEST_F(GameletComponentTest, GetChangedComponents) {
 
   // Force equal timestamps, so that we don't depend on when the files were
   // actually written to everyone's drives.
+  // Also force set build_version to developer since otherwise we would skip
+  // component size check.
   ASSERT_EQ(components.size(), other_components.size());
   for (size_t n = 0; n < components.size(); ++n) {
     other_components[n].modified_time = components[n].modified_time;
+    other_components[n].build_version = DEV_BUILD_VERSION;
+
+    EXPECT_NE(components, other_components);
+  }
+}
+
+TEST_F(GameletComponentTest, GetChangedComponents_BuildVersionChanged) {
+  std::vector<GameletComponent> components;
+  EXPECT_OK(GameletComponent::Get({valid_component_path_}, &components));
+
+  std::vector<GameletComponent> other_components;
+  EXPECT_OK(GameletComponent::Get({other_component_path_}, &other_components));
+
+  ASSERT_EQ(components.size(), other_components.size());
+  for (size_t n = 0; n < components.size(); ++n) {
+    other_components[n].modified_time = components[n].modified_time;
+    other_components[n].size = components[n].size;
+    components[n].build_version = "build_version";
+    other_components[n].build_version = "other_build_version";
 
     EXPECT_NE(components, other_components);
   }

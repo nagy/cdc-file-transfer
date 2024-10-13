@@ -59,8 +59,12 @@ class RemoteUtilTest : public ::testing::Test {
 };
 
 TEST_F(RemoteUtilTest, BuildProcessStartInfoForSsh) {
-  ProcessStartInfo si = util_.BuildProcessStartInfoForSsh(kCommand);
-  ExpectContains(si.command, {"ssh", kUserHostArg, kCommand});
+  ProcessStartInfo si =
+      util_.BuildProcessStartInfoForSsh(kCommand, ArchType::kLinux_x86_64);
+  ExpectContains(si.command, {"ssh", "-tt", kUserHostArg, kCommand});
+
+  si = util_.BuildProcessStartInfoForSsh(kCommand, ArchType::kWindows_x86_64);
+  ExpectContains(si.command, {"ssh", "-T", kUserHostArg, kCommand});
 }
 
 TEST_F(RemoteUtilTest, BuildProcessStartInfoForSshPortForward) {
@@ -75,19 +79,20 @@ TEST_F(RemoteUtilTest, BuildProcessStartInfoForSshPortForward) {
 
 TEST_F(RemoteUtilTest, BuildProcessStartInfoForSshPortForwardAndCommand) {
   ProcessStartInfo si = util_.BuildProcessStartInfoForSshPortForwardAndCommand(
-      kLocalPort, kRemotePort, kRegular, kCommand);
+      kLocalPort, kRemotePort, kRegular, kCommand, ArchType::kLinux_x86_64);
   ExpectContains(si.command,
                  {"ssh", kUserHostArg, kPortForwardingArg, kCommand});
 
   si = util_.BuildProcessStartInfoForSshPortForwardAndCommand(
-      kLocalPort, kRemotePort, kReverse, kCommand);
+      kLocalPort, kRemotePort, kReverse, kCommand, ArchType::kLinux_x86_64);
   ExpectContains(si.command,
                  {"ssh", kUserHostArg, kReversePortForwardingArg, kCommand});
 }
 TEST_F(RemoteUtilTest, BuildProcessStartInfoForSshWithCustomCommand) {
   constexpr char kCustomSshCmd[] = "C:\\path\\to\\ssh.exe --fooarg --bararg=42";
   util_.SetSshCommand(kCustomSshCmd);
-  ProcessStartInfo si = util_.BuildProcessStartInfoForSsh(kCommand);
+  ProcessStartInfo si =
+      util_.BuildProcessStartInfoForSsh(kCommand, ArchType::kLinux_x86_64);
   ExpectContains(si.command, {kCustomSshCmd});
 }
 
@@ -125,6 +130,28 @@ TEST_F(RemoteUtilTest, QuoteForSsh) {
             "\"\\\"~invalid user name/foo\\\"\"");
   EXPECT_EQ(RemoteUtil::QuoteForSsh("~user-name69/foo"),
             "\"~user-name69/\\\"foo\\\"\"");  // Nice!
+}
+
+TEST_F(RemoteUtilTest, ScpToSftpCommand) {
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand(""), "");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("scp"), "sftp");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("scp.exe"), "sftp.exe");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("scp --arg"), "sftp --arg");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("ScP --aRg"), "sftp --aRg");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("winscp"), "winsftp");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("winscp.exe"), "winsftp.exe");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("winscp --arg"), "winsftp --arg");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("C:\\path\\to\\scp"),
+            "C:\\path\\to\\sftp");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("C:\\path\\to\\scp.exe"),
+            "C:\\path\\to\\sftp.exe");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("C:\\path\\to\\scp.exe --arg"),
+            "C:\\path\\to\\sftp.exe --arg");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("C:\\scp.exe --argwithscp"),
+            "C:\\sftp.exe --argwithscp");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("C:\\path_with_scp\\scp"),
+            "C:\\path_with_scp\\sftp");
+  EXPECT_EQ(RemoteUtil::ScpToSftpCommand("C:\\path\\to\\somethingelse"), "");
 }
 
 }  // namespace

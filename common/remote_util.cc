@@ -20,6 +20,8 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "common/path.h"
+#include "common/status_macros.h"
+#include "common/util.h"
 
 namespace cdc_ft {
 namespace {
@@ -30,6 +32,22 @@ std::string GetPortForwardingArg(int local_port, int remote_port,
   if (reverse)
     return absl::StrFormat("-R%i:localhost:%i ", remote_port, local_port);
   return absl::StrFormat("-L%i:localhost:%i ", local_port, remote_port);
+}
+
+const char* GetFlagsForArch(ArchType remote_arch_type) {
+  if (IsWindowsArchType(remote_arch_type)) {
+    // Disable pseudo-TTY. Otherwise, the output is riddled by Ansi control
+    // sequences and almost impossible to parse without handling them.
+    return "-T";
+  }
+
+  if (IsLinuxArchType(remote_arch_type)) {
+    // Force pseudo-TTY.
+    return "-tt";
+  }
+
+  assert(!"Unhandled arch type");
+  return "";
 }
 
 }  // namespace
@@ -47,8 +65,32 @@ void RemoteUtil::SetScpCommand(std::string scp_command) {
   scp_command_ = std::move(scp_command);
 }
 
+void RemoteUtil::SetSftpCommand(std::string sftp_command) {
+  sftp_command_ = std::move(sftp_command);
+}
+
 void RemoteUtil::SetSshCommand(std::string ssh_command) {
   ssh_command_ = std::move(ssh_command);
+}
+
+// static
+std::string RemoteUtil::ScpToSftpCommand(std::string scp_command) {
+  // "scp", "SCP", "winscp.exe", "C:\path\to\scp", "/scppath/scp --foo" etc.
+  std::string lower_scp_command = scp_command;
+  std::transform(lower_scp_command.begin(), lower_scp_command.end(),
+                 lower_scp_command.begin(), ::tolower);
+  size_t pos = 0;
+  while ((pos = lower_scp_command.find("scp", pos)) != std::string::npos) {
+    // This may access the string at scp_command.size(), but that's well defined
+    // in C++11 and returns 0.
+    const char next_ch = lower_scp_command[pos + 3];
+    if ((next_ch == 0 || next_ch == '.' || next_ch == ' ')) {
+      return scp_command.replace(pos, 3, "sftp");
+    }
+    ++pos;
+  }
+
+  return std::string();
 }
 
 absl::Status RemoteUtil::Scp(std::vector<std::string> source_filepaths,
@@ -77,27 +119,82 @@ absl::Status RemoteUtil::Scp(std::vector<std::string> source_filepaths,
   return process_factory_->Run(start_info);
 }
 
+absl::Status RemoteUtil::Sftp(const std::string& commands,
+                              const std::string& initial_local_dir,
+                              bool compress) {
+  // sftp doesn't take |commands| as argument, so write it to a temp file.
+  std::string cmd_path =
+      path::Join(path::GetTempDir(), "__sftp_cmd__" + Util::GenerateUniqueId());
+  RETURN_IF_ERROR(path::WriteFile(cmd_path, commands),
+                  "Failed to write sftp commands to '%s'", cmd_path);
+
+  // -p preserves timestamps. This enables timestamp-based up-to-date checks.
+  ProcessStartInfo start_info;
+  start_info.flags = ProcessFlags::kNoWindow;
+  start_info.command = absl::StrFormat(
+      "%s %s %s -p -b %s %s", sftp_command_,
+      quiet_ || verbosity_ < 2 ? "-q" : "", compress ? "-C" : "",
+      QuoteForWindows(cmd_path), QuoteForWindows(user_host_));
+  start_info.name = "sftp";
+  start_info.startup_dir = initial_local_dir;
+  start_info.forward_output_to_log = forward_output_to_log_;
+
+  RETURN_IF_ERROR(process_factory_->Run(start_info));
+
+  // Note: Keep |cmd_path| in case of an error for debugging purposes.
+  path::RemoveFile(cmd_path).IgnoreError();
+  return absl::OkStatus();
+}
+
 absl::Status RemoteUtil::Chmod(const std::string& mode,
                                const std::string& remote_path, bool quiet) {
   std::string remote_command =
       absl::StrFormat("chmod %s %s %s", QuoteForSsh(mode),
                       QuoteForSsh(remote_path), quiet ? "-f" : "");
 
-  return Run(remote_command, "chmod");
+  return Run(remote_command, "chmod", ArchType::kLinux_x86_64);
 }
 
-absl::Status RemoteUtil::Run(std::string remote_command, std::string name) {
+absl::Status RemoteUtil::Run(std::string remote_command, std::string name,
+                             ArchType remote_arch_type) {
   ProcessStartInfo start_info =
-      BuildProcessStartInfoForSsh(std::move(remote_command));
+      BuildProcessStartInfoForSsh(std::move(remote_command), remote_arch_type);
   start_info.name = std::move(name);
   start_info.forward_output_to_log = forward_output_to_log_;
 
   return process_factory_->Run(start_info);
 }
 
+absl::Status RemoteUtil::RunWithCapture(std::string remote_command,
+                                        std::string name, std::string* std_out,
+                                        std::string* std_err,
+                                        ArchType remote_arch_type) {
+  ProcessStartInfo start_info =
+      BuildProcessStartInfoForSsh(std::move(remote_command), remote_arch_type);
+  start_info.name = std::move(name);
+  start_info.forward_output_to_log = forward_output_to_log_;
+
+  if (std_out) {
+    start_info.stdout_handler = [std_out](const char* data, size_t size) {
+      std_out->append(data, size);
+      return absl::OkStatus();
+    };
+  }
+
+  if (std_err) {
+    start_info.stderr_handler = [std_err](const char* data, size_t size) {
+      std_err->append(data, size);
+      return absl::OkStatus();
+    };
+  }
+
+  return process_factory_->Run(start_info);
+}
+
 ProcessStartInfo RemoteUtil::BuildProcessStartInfoForSsh(
-    std::string remote_command) {
-  return BuildProcessStartInfoForSshInternal("", "-- " + remote_command);
+    std::string remote_command, ArchType remote_arch_type) {
+  return BuildProcessStartInfoForSshInternal("", "-- " + remote_command,
+                                             remote_arch_type);
 }
 
 ProcessStartInfo RemoteUtil::BuildProcessStartInfoForSshPortForward(
@@ -105,28 +202,34 @@ ProcessStartInfo RemoteUtil::BuildProcessStartInfoForSshPortForward(
   // Usually, one would pass in -N here, but this makes the connection terribly
   // slow! As a workaround, don't use -N (will open a shell), but simply eat the
   // output.
+  // Note: Don't use the Windows args now. It implies -T instead of -tt, which
+  // will make the process exit immediately.
   ProcessStartInfo si = BuildProcessStartInfoForSshInternal(
-      GetPortForwardingArg(local_port, remote_port, reverse) + "-n ", "");
+      GetPortForwardingArg(local_port, remote_port, reverse) + "-n ", "",
+      ArchType::kLinux_x86_64);
   si.stdout_handler = [](const void*, size_t) { return absl::OkStatus(); };
   return si;
 }
 
 ProcessStartInfo RemoteUtil::BuildProcessStartInfoForSshPortForwardAndCommand(
-    int local_port, int remote_port, bool reverse, std::string remote_command) {
+    int local_port, int remote_port, bool reverse, std::string remote_command,
+    ArchType remote_arch_type) {
   return BuildProcessStartInfoForSshInternal(
       GetPortForwardingArg(local_port, remote_port, reverse),
-      "-- " + remote_command);
+      "-- " + remote_command, remote_arch_type);
 }
 
 ProcessStartInfo RemoteUtil::BuildProcessStartInfoForSshInternal(
-    std::string forward_arg, std::string remote_command_arg) {
+    std::string forward_arg, std::string remote_command_arg,
+    ArchType remote_arch_type) {
   ProcessStartInfo start_info;
   start_info.command = absl::StrFormat(
-      "%s %s -tt %s "
+      "%s %s %s %s "
       "-oServerAliveCountMax=6 "  // Number of lost msgs before ssh terminates
       "-oServerAliveInterval=5 "  // Time interval between alive msgs
       "%s %s",
-      ssh_command_, quiet_ || verbosity_ < 2 ? "-q" : "", forward_arg,
+      ssh_command_, GetFlagsForArch(remote_arch_type),
+      quiet_ || verbosity_ < 2 ? "-q" : "", forward_arg,
       QuoteForWindows(user_host_), remote_command_arg);
   start_info.forward_output_to_log = forward_output_to_log_;
   start_info.flags = ProcessFlags::kNoWindow;

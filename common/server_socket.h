@@ -14,11 +14,14 @@
  * limitations under the License.
  */
 
-#ifndef CDC_RSYNC_SERVER_SERVER_SOCKET_H_
-#define CDC_RSYNC_SERVER_SERVER_SOCKET_H_
+#ifndef COMMON_SERVER_SOCKET_H_
+#define COMMON_SERVER_SOCKET_H_
 
 #include "absl/status/status.h"
-#include "cdc_rsync/base/socket.h"
+#include "absl/status/statusor.h"
+#include "common/socket.h"
+
+struct addrinfo;
 
 namespace cdc_ft {
 
@@ -27,8 +30,19 @@ class ServerSocket : public Socket {
   ServerSocket();
   ~ServerSocket();
 
+  // Returns an available ephemeral port that can be used as a listening port.
+  // Note that calling this function, followed by StartListening() or similar,
+  // is slightly racy as another process might use the port in the meantime.
+  // However, the OS usually returns ephemeral ports in a round-robin manner,
+  // and ports remain in TIME_WAIT state for a while, which may block other apps
+  // from reusing the port. Hence, the chances of races are small. Nevertheless,
+  // consider calling StartListening() with zero |port| if possible.
+  static absl::StatusOr<int> FindAvailablePort();
+
   // Starts listening for connections on |port|.
-  absl::Status StartListening(int port);
+  // Passing 0 as port will bind to any available port.
+  // Returns the port that was bound to.
+  absl::StatusOr<int> StartListening(int port);
 
   // Stops listening for connections. No-op if already stopped/never started.
   void StopListening();
@@ -50,6 +64,11 @@ class ServerSocket : public Socket {
                        size_t* bytes_received) override;
 
  private:
+  // Called by StartListening() for a specific IPV4 or IPV6 |addr_info|.
+  // Passing 0 as port will bind to any available port.
+  // Returns the port that was bound to.
+  absl::StatusOr<int> StartListeningInternal(int port, addrinfo* addr);
+
   std::unique_ptr<struct ServerSocketInfo> socket_info_;
 };
 

@@ -21,16 +21,18 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "cdc_rsync/base/message_pump.h"
-#include "cdc_rsync/client_socket.h"
 #include "cdc_rsync/progress_tracker.h"
+#include "common/client_socket.h"
 #include "common/path_filter.h"
-#include "common/port_manager.h"
-#include "common/remote_util.h"
+#include "common/process.h"
 
 namespace cdc_ft {
 
 class Process;
+class RemoteUtil;
+class ServerArch;
 class ZstdStream;
 
 class CdcRsyncClient {
@@ -50,12 +52,14 @@ class CdcRsyncClient {
     std::string copy_dest;
     int compress_level = 6;
     int connection_timeout_sec = 10;
-    int forward_port_first = 44450;
-    int forward_port_last = 44459;
     std::string ssh_command;
-    std::string scp_command;
+    std::string sftp_command;
     std::string sources_dir;  // Base dir for files loaded for --files-from.
     PathFilter filter;
+
+    // Backwards compatibility for switching from scp to sftp.
+    // Used internally, do not use.
+    std::string deprecated_scp_command;
 
     // Compression level 0 is invalid.
     static constexpr int kMinCompressLevel = -5;
@@ -73,7 +77,7 @@ class CdcRsyncClient {
  private:
   // Starts the server process. If the method returns a status with tag
   // |kTagDeployServer|, Run() calls DeployServer() and tries again.
-  absl::Status StartServer();
+  absl::Status StartServer(const ServerArch& arch);
 
   // Stops the server process.
   absl::Status StopServer();
@@ -85,7 +89,7 @@ class CdcRsyncClient {
   absl::Status Sync();
 
   // Copies all gamelet components to the gamelet.
-  absl::Status DeployServer();
+  absl::Status DeployServer(const ServerArch& arch);
 
   // Sends relevant options to the server.
   absl::Status SendOptions();
@@ -117,12 +121,14 @@ class CdcRsyncClient {
   // Stops the zstd compression stream.
   absl::Status StopCompressionStream();
 
+  // Returns true if the target is a remote target.
+  bool IsRemoteConnection() const { return remote_util_ != nullptr; }
+
   Options options_;
   std::vector<std::string> sources_;
   const std::string destination_;
   WinProcessFactory process_factory_;
-  RemoteUtil remote_util_;
-  PortManager port_manager_;
+  std::unique_ptr<RemoteUtil> remote_util_;
   std::unique_ptr<SocketFinalizer> socket_finalizer_;
   ClientSocket socket_;
   MessagePump message_pump_{&socket_, MessagePump::PacketReceivedDelegate()};
@@ -131,10 +137,11 @@ class CdcRsyncClient {
   std::unique_ptr<ZstdStream> compression_stream_;
 
   std::unique_ptr<Process> server_process_;
+  std::unique_ptr<Process> port_forwarding_process_;
   std::string server_output_;  // Written in a background thread. Do not access
   std::string server_error_;   // while the server process is active.
   int server_exit_code_ = 0;
-  std::atomic_bool is_server_listening_{false};
+  std::atomic_int server_listen_port_{0};
   bool is_server_error_ = false;
 
   // All source files found on the client.

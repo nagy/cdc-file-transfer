@@ -50,19 +50,14 @@ void AssetStreamConfig::RegisterCommandLineFlags(lyra::command& cmd,
                              "asset stream service, default: " +
                              std::to_string(service_port_)));
 
-  session_cfg_.forward_port_first = MultiSession::kDefaultForwardPortFirst;
-  session_cfg_.forward_port_last = MultiSession::kDefaultForwardPortLast;
-  cmd.add_argument(
-      lyra::opt(base_command.PortRangeParser("--forward-port",
-                                             &session_cfg_.forward_port_first,
-                                             &session_cfg_.forward_port_last),
-                "port")
-          .name("--forward-port")
-          .help("TCP port or range used for SSH port forwarding, default: " +
-                std::to_string(MultiSession::kDefaultForwardPortFirst) + "-" +
-                std::to_string(MultiSession::kDefaultForwardPortLast) +
-                ". If a range is specified, searches for available ports "
-                "(slower)."));
+  cmd.add_argument(lyra::opt(base_command.PortRangeParser(
+                                 "--forward-port",
+                                 &session_cfg_.deprecated_forward_port_first,
+                                 &session_cfg_.deprecated_forward_port_last),
+                             "port")
+                       .name("--forward-port")
+                       .help("[Deprecated, ignored] TCP port or range used for "
+                             "SSH port forwarding"));
 
   session_cfg_.verbosity = kDefaultVerbosity;
   cmd.add_argument(lyra::opt(session_cfg_.verbosity, "num")
@@ -157,9 +152,9 @@ void AssetStreamConfig::RegisterCommandLineFlags(lyra::command& cmd,
                 "connection to the host. See also --dev-src-dir."));
 
   cmd.add_argument(
-      lyra::opt(dev_target_.scp_command, "cmd")
-          .name("--dev-scp-command")
-          .help("Scp command and extra flags to use for the "
+      lyra::opt(dev_target_.sftp_command, "cmd")
+          .name("--dev-sftp-command")
+          .help("Sftp command and extra flags to use for the "
                 "connection to the host. See also --dev-src-dir."));
 
   cmd.add_argument(
@@ -190,8 +185,6 @@ absl::Status AssetStreamConfig::LoadFromFile(const std::string& path) {
   } while (0)
 
   ASSIGN_VAR(service_port_, "service-port", Int);
-  ASSIGN_VAR(session_cfg_.forward_port_first, "forward-port-first", Int);
-  ASSIGN_VAR(session_cfg_.forward_port_last, "forward-port-last", Int);
   ASSIGN_VAR(session_cfg_.verbosity, "verbosity", Int);
   ASSIGN_VAR(session_cfg_.fuse_debug, "debug", Bool);
   ASSIGN_VAR(session_cfg_.fuse_singlethreaded, "singlethreaded", Bool);
@@ -231,8 +224,6 @@ absl::Status AssetStreamConfig::LoadFromFile(const std::string& path) {
 std::string AssetStreamConfig::ToString() {
   std::ostringstream ss;
   ss << "service-port                 = " << service_port_ << std::endl;
-  ss << "forward-port                 = " << session_cfg_.forward_port_first
-     << "-" << session_cfg_.forward_port_last << std::endl;
   ss << "verbosity                    = " << session_cfg_.verbosity
      << std::endl;
   ss << "debug                        = " << session_cfg_.fuse_debug
@@ -258,7 +249,7 @@ std::string AssetStreamConfig::ToString() {
   ss << "dev-user-host                = " << dev_target_.user_host << std::endl;
   ss << "dev-ssh-command              = " << dev_target_.ssh_command
      << std::endl;
-  ss << "dev-scp-command              = " << dev_target_.scp_command
+  ss << "dev-sftp-command             = " << dev_target_.sftp_command
      << std::endl;
   ss << "dev-mount-dir                = " << dev_target_.mount_dir << std::endl;
   return ss.str();
